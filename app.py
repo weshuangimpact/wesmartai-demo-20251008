@@ -1,10 +1,9 @@
 # ====================================================================
-# WesmartAI 證據報告 Web App (final14.0-user_flow)
+# WesmartAI 證據報告 Web App (final13.2-stable)
 # 作者: Gemini & User
-# 核心更新 (流程定案):
-# 1. 確立最終使用者流程：生成預覽 -> 結束並下載所有原圖 -> 產出PDF報告。
-# 2. proof_event.json 僅在伺服器端生成與保存，不再提供給使用者下載。
-# 3. /finalize_session 路由的回傳值已修改，只包含圖片的下載連結。
+# 修正:
+# 1. 恢復了前端的 Seed, Width, Height 輸入欄位。
+# 2. 同步更新後端 /generate 路由，以接收並使用這些參數。
 # ====================================================================
 
 import requests, json, hashlib, uuid, datetime, random, time, os, io, base64
@@ -23,14 +22,15 @@ static_folder = 'static'
 if not os.path.exists(static_folder): os.makedirs(static_folder)
 app.config['UPLOAD_FOLDER'] = static_folder
 
-# --- Helper Functions and PDF Class (內容與前版相同，此處省略) ---
+# --- (Helper Functions 和 WesmartPDFReport Class 與前版完全相同，此處省略) ---
 def sha256_bytes(b): return hashlib.sha256(b).hexdigest()
+
 class WesmartPDFReport(FPDF):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if not os.path.exists("NotoSansTC.otf"):
+            print("正在下載中文字型...")
             try:
-                print("正在下載中文字型...")
                 r = requests.get("https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf")
                 r.raise_for_status()
                 with open("NotoSansTC.otf", "wb") as f: f.write(r.content)
@@ -87,118 +87,93 @@ class WesmartPDFReport(FPDF):
         self.ln(10); self.set_font("NotoSansTC", "", 10); self.cell(0, 10, "掃描 QR Code 前往驗證頁面", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
         self.image(qr_path, w=50, x=(self.w-50)/2)
 # --- 全域變數 ---
-session_previews = []  # 用於累積預覽生成任務
-latest_proof_data = None # 用於在 finalize 和 create_report 之間傳遞數據
+latest_proof_data = None
 
 @app.route('/')
 def index():
-    global session_previews, latest_proof_data
-    session_previews = []
+    global latest_proof_data
     latest_proof_data = None
     return render_template('index.html', api_key_set=bool(API_key))
 
-# 步驟1: 生成預覽圖
 @app.route('/generate', methods=['POST'])
 def generate():
-    if not API_key: return jsonify({"error": "後端尚未設定 TOGETHER_API_KEY 環境變數"}), 500
-    
+    global latest_proof_data
     data = request.json
-    prompt = data.get('prompt')
-    if not prompt: return jsonify({"error": "Prompt 為必填項"}), 400
-
+    applicant_name = data.get('applicant_name')
+    if not applicant_name: return jsonify({"error": "出證申請人名稱為必填項"}), 400
+    
     try:
-        seed_value = random.randint(1, 10**9)
-        payload = {"model": "black-forest-labs/FLUX.1-schnell", "prompt": prompt, "seed": seed_value, "steps": 8, "width": 512, "height": 512}
-        
+        # ===== 修改開始: 接收 Seed 與尺寸參數 =====
+        prompt = data.get('prompt')
+        seed_input = data.get('seed')
+        width = int(data.get('width', 512))
+        height = int(data.get('height', 512))
+        seed_value = int(seed_input) if seed_input and seed_input.isdigit() else random.randint(1, 10**9)
+        # ===== 修改結束 =====
+
+        payload = {"model": "black-forest-labs/FLUX.1-schnell", "prompt": prompt, "seed": seed_value, "steps": 8, "width": width, "height": height}
         res = requests.post("https://api.together.xyz/v1/images/generations", headers={"Authorization": f"Bearer {API_key}"}, json=payload, timeout=60)
         res.raise_for_status()
         img_bytes = requests.get(res.json()["data"][0]["url"], timeout=60).content
         
-        filename = f"preview_v{len(session_previews) + 1}_{int(time.time())}.png"
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        Image.open(io.BytesIO(img_bytes)).save(filepath)
+        img_filename = f"image_{uuid.uuid4()}.png"
+        img_filepath = os.path.join(app.config['UPLOAD_FOLDER'], img_filename)
+        Image.open(io.BytesIO(img_bytes)).save(img_filepath)
+        with open(img_filepath, "rb") as f: definitive_bytes = f.read()
+        img_base64_str = base64.b64encode(definitive_bytes).decode('utf-8')
+        snapshot_hash = sha256_bytes(img_base64_str.encode('utf-8'))
 
-        # 將預覽任務的資訊加入 session 列表
-        session_previews.append({
-            "prompt": prompt,
-            "seed": seed_value,
-            "model": payload['model'],
-            "filepath": filepath,
-            "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()
-        })
-        
-        return jsonify({
-            "success": True, 
-            "preview_url": url_for('static_preview', filename=filename),
-            "version": len(session_previews)
-        })
-
-    except Exception as e:
-        return jsonify({"error": f"生成失敗: {str(e)}"}), 500
-
-# 步驟2: 結束任務，生成所有證據正本
-@app.route('/finalize_session', methods=['POST'])
-def finalize_session():
-    global latest_proof_data, session_previews
-    applicant_name = request.json.get('applicant_name')
-    if not applicant_name: return jsonify({"error": "出證申請人名稱為必填項"}), 400
-    if not session_previews: return jsonify({"error": "沒有任何預覽圖像可供結束任務"}), 400
-
-    try:
-        snapshots = []
-        image_urls = []
-        
-        # 遍歷所有預覽圖，生成正式的 snapshot 證據
-        for i, preview in enumerate(session_previews):
-            with open(preview['filepath'], "rb") as f: definitive_bytes = f.read()
-            img_base64_str = base64.b64encode(definitive_bytes).decode('utf-8')
-            snapshot_hash = sha256_bytes(img_base64_str.encode('utf-8'))
-            
-            snapshots.append({
-                "version_index": i + 1,
-                "timestamp_utc": preview['timestamp_utc'],
-                "snapshot_hash": snapshot_hash,
-                "prompt": preview['prompt'],
-                "seed": preview['seed'],
-                "model": preview['model'],
-                "content_base64": img_base64_str
-            })
-            image_urls.append(url_for('static_download', filename=os.path.basename(preview['filepath'])))
-
-        # 建立 proof_event.json 的資料結構
         report_id = str(uuid.uuid4())
         trace_token = str(uuid.uuid4())
         issued_at_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        snapshot = {
+            "version_index": 1, "timestamp_utc": issued_at_iso, "snapshot_hash": snapshot_hash,
+            "prompt": prompt, "seed": seed_value, "model": payload['model'],
+            "content_base64": img_base64_str
+        }
         
-        temp_proof_for_hashing = {"report_id": report_id, "event_proof": {"trace_token": trace_token, "snapshots": snapshots}}
+        temp_proof_for_hashing = {
+            "report_id": report_id, "issuer": "WesmartAI Inc.", "applicant": applicant_name, "issued_at": issued_at_iso,
+            "event_proof": { "trace_token": trace_token, "snapshots": [snapshot] }
+        }
         proof_string_for_hashing = json.dumps(temp_proof_for_hashing, sort_keys=True, ensure_ascii=False).encode('utf-8')
         final_event_hash = sha256_bytes(proof_string_for_hashing)
 
         proof_data = {
             "report_id": report_id, "issuer": "WesmartAI Inc.", "applicant": applicant_name, "issued_at": issued_at_iso,
-            "event_proof": { "trace_token": trace_token, "final_event_hash": final_event_hash, "snapshots": snapshots },
-            "verification": {"verify_url": f"https://wesmart.ai/verify?hash={final_event_hash}"}
+            "event_proof": { "trace_token": trace_token, "final_event_hash": final_event_hash, "snapshots": [snapshot] },
+            "verification": {
+                "method": "SHA-256 over a sorted, compact JSON structure",
+                "validation_target": "final_event_hash",
+                "verify_url": f"https://wesmart.ai/verify?hash={final_event_hash}"
+            },
+            "metadata": { "document_type": "AI_GENERATION_PROOF_EVENT", "format_version": "1.1" }
         }
 
-        # 儲存 proof_event.json 檔案到伺服器 (供後續上傳WORM或生成報告使用)
         json_filename = f"proof_event_{report_id}.json"
         json_filepath = os.path.join(app.config['UPLOAD_FOLDER'], json_filename)
         with open(json_filepath, 'w', encoding='utf-8') as f:
             json.dump(proof_data, f, ensure_ascii=False, indent=2)
 
-        latest_proof_data = proof_data # 儲存到全域變數
+        latest_proof_data = proof_data
 
-        # 回傳所有原圖的下載連結給使用者
-        return jsonify({"success": True, "image_urls": image_urls})
+        return jsonify({
+            "success": True,
+            "image_url": url_for('static_download', filename=img_filename),
+            "json_url": url_for('static_download', filename=json_filename),
+            "preview_image_url": url_for('static_preview', filename=img_filename)
+        })
 
     except Exception as e:
-        print(f"結束任務失敗: {e}")
-        return jsonify({"error": f"結束任務失敗: {str(e)}"}), 500
+        print(f"生成失敗: {e}")
+        return jsonify({"error": f"生成失敗: {str(e)}"}), 500
 
-# 步驟3: 產生 PDF 報告
-@app.route('/create_report', methods=['POST'])
-def create_report():
-    if not latest_proof_data: return jsonify({"error": "請先結束任務並生成證據"}), 400
+@app.route('/finalize', methods=['POST'])
+def finalize():
+    global latest_proof_data
+    if not latest_proof_data:
+        return jsonify({"error": "請先生成圖像和證據檔案"}), 400
     
     try:
         report_id = latest_proof_data['report_id']
@@ -211,17 +186,22 @@ def create_report():
         report_filepath = os.path.join(app.config['UPLOAD_FOLDER'], report_filename)
         pdf.output(report_filepath)
 
-        return jsonify({"success": True, "report_url": url_for('static_download', filename=report_filename)})
+        return jsonify({
+            "success": True,
+            "report_url": url_for('static_download', filename=report_filename),
+        })
     except Exception as e:
         print(f"報告生成失敗: {e}")
         return jsonify({"error": f"報告生成失敗: {str(e)}"}), 500
 
 # --- 靜態檔案路由 ---
 @app.route('/static/preview/<path:filename>')
-def static_preview(filename): return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+def static_preview(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 @app.route('/static/download/<path:filename>')
-def static_download(filename): return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
+def static_download(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
 
 if __name__ == '__main__':
     app.run(debug=True)
