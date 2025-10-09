@@ -1,119 +1,273 @@
-# ==========================================================
-# WesmartAI × Together AI (Flux Schnell)
-# 新增功能：每張生成圖下方加入「以此為基底再生成」
-# ==========================================================
+# ====================================================================
+# WesmartAI 證據報告 Web App (final_definitive_flow_v2_flux_ultra)
+# 作者: Gemini & User
+# 核心架構 (v2):
+# 1. API 端點切換至 BFL Flux 1.1 Ultra，支援 Proof Pair 機制。
+# 2. /generate 路由擴充，可接收 image_base64 進行 Image-to-Image 生成。
+# 3. 新增非同步輪詢機制以應對 BFL API。
+# 4. 前端新增「以此圖微調」按鈕，觸發 Proof Pair 流程。
+# ====================================================================
 
-from flask import Flask, render_template, request, jsonify
-import requests, os, base64, hashlib, datetime, uuid
-from fpdf import FPDF
+import requests, json, hashlib, uuid, datetime, random, time, os, io, base64
+from flask import Flask, render_template, request, jsonify, send_from_directory, url_for
 from PIL import Image
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
+import qrcode
 
+# --- 讀取環境變數 ---
+# 優先使用 BFL_API_KEY，若無則 fallback 至舊的 TOGETHER_API_KEY
+BFL_API_KEY = os.getenv("BFL_API_KEY")
+API_key = BFL_API_KEY or os.getenv("TOGETHER_API_KEY") 
+
+# --- Flask App 初始化 ---
 app = Flask(__name__)
+static_folder = 'static'
+if not os.path.exists(static_folder): os.makedirs(static_folder)
+app.config['UPLOAD_FOLDER'] = static_folder
 
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")  # 建議環境變數設定
-MODEL_NAME = "black-forest-labs/FLUX.1-schnell"
-GENERATED_DIR = "static/generated"
-os.makedirs(GENERATED_DIR, exist_ok=True)
+# --- Helper Functions and PDF Class (與前版相同) ---
+def sha256_bytes(b): return hashlib.sha256(b).hexdigest()
 
+class WesmartPDFReport(FPDF):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not os.path.exists("NotoSansTC.otf"):
+            print("正在下載中文字型...")
+            try:
+                r = requests.get("https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf")
+                r.raise_for_status()
+                with open("NotoSansTC.otf", "wb") as f: f.write(r.content)
+                print("字型下載完成。")
+            except Exception as e: print(f"字型下載失敗: {e}")
+        self.add_font("NotoSansTC", "", "NotoSansTC.otf")
+        self.set_auto_page_break(auto=True, margin=25); self.alias_nb_pages()
+        self.logo_path = "LOGO.jpg" if os.path.exists("LOGO.jpg") else None
+    def header(self):
+        if self.logo_path:
+            with self.local_context(fill_opacity=0.08, stroke_opacity=0.08):
+                img_w=120; center_x=(self.w-img_w)/2; center_y=(self.h-img_w)/2; self.image(self.logo_path, x=center_x, y=center_y, w=img_w)
+        if self.page_no() > 1: self.set_font("NotoSansTC", "", 9); self.set_text_color(128); self.cell(0, 10, "WesmartAI 生成式 AI 證據報告", new_x=XPos.LMARGIN, new_y=YPos.TOP, align='L'); self.cell(0, 10, "WesmartAI Inc.", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    def footer(self): self.set_y(-15); self.set_font("NotoSansTC", "", 8); self.set_text_color(128); self.cell(0, 10, f'第 {self.page_no()}/{{nb}} 頁', align='C')
+    def chapter_title(self, title): self.set_font("NotoSansTC", "", 16); self.set_text_color(0); self.cell(0, 12, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='L'); self.ln(6)
+    def chapter_body(self, content): self.set_font("NotoSansTC", "", 10); self.set_text_color(50); self.multi_cell(0, 7, content, align='L'); self.ln()
+    def create_cover(self, meta):
+        self.add_page();
+        if self.logo_path: self.image(self.logo_path, x=(self.w-60)/2, y=25, w=60)
+        self.set_y(100); self.set_font("NotoSansTC", "", 28); self.cell(0, 20, "WesmartAI 證據報告", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'); self.ln(20)
+        self.set_font("NotoSansTC", "", 12)
+        data = [("出證申請人:", meta.get('applicant', 'N/A')), ("申請事項:", "WesmartAI 生成式 AI 證據報告"), ("申請出證時間:", meta.get('issued_at', 'N/A')), ("出證編號 (報告ID):", meta.get('report_id', 'N/A')), ("出證單位:", meta.get('issuer', 'N/A'))]
+        for row in data: self.cell(20); self.cell(45, 10, row[0], align='L'); self.multi_cell(0, 10, row[1], new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='L')
+    def create_generation_details_page(self, proof_data):
+        self.add_page(); self.chapter_title("一、生成任務基本資訊"); self.set_font("NotoSansTC", "", 10); self.set_text_color(0)
+        experiment_meta = {"Trace Token": proof_data['event_proof']['trace_token'], "總共版本數": len(proof_data['event_proof']['snapshots'])}
+        for key, value in experiment_meta.items():
+            self.cell(40, 8, f"  {key}:", align='L'); self.set_font("NotoSansTC", "", 9); self.set_text_color(80)
+            self.multi_cell(0, 8, str(value), align='L', new_x=XPos.LMARGIN, new_y=YPos.NEXT); self.set_font("NotoSansTC", "", 10); self.set_text_color(0)
+        self.ln(10)
+        self.chapter_title("二、各版本生成快照")
+        for snapshot in proof_data['event_proof']['snapshots']:
+            self.set_font("NotoSansTC", "", 12); self.set_text_color(0); self.cell(0, 10, f"版本索引: {snapshot['version_index']}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='L'); self.ln(2)
+            details = [("時間戳記 (UTC)", snapshot['timestamp_utc']), ("圖像雜湊 (SHA-256 over Base64)", snapshot['snapshot_hash']), ("輸入指令 (Prompt)", snapshot['prompt']), ("隨機種子 (Seed)", str(snapshot['seed']))]
+            for key, value in details:
+                self.set_font("NotoSansTC", "", 10); self.set_text_color(0); self.cell(60, 7, f"  - {key}:", align='L'); self.set_font("NotoSansTC", "", 9); self.set_text_color(80)
+                self.multi_cell(0, 7, str(value), align='L', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            self.ln(5)
+            try:
+                img_bytes = base64.b64decode(snapshot['content_base64'])
+                img_file_obj = io.BytesIO(img_bytes)
+                self.image(img_file_obj, x=(self.w-80)/2, w=80, type='PNG')
+            except Exception as e: print(f"在PDF中顯示圖片失敗: {e}")
+            self.ln(15)
+    def create_conclusion_page(self, proof_data):
+        self.add_page(); self.chapter_title("三、報告驗證")
+        self.chapter_body("本報告的真實性與完整性，取決於其對應的 `proof_event.json` 證據檔案。此 JSON 檔案的雜湊值（Final Event Hash）被記錄於下，可用於比對與驗證。")
+        self.ln(10); self.set_font("NotoSansTC", "", 12); self.set_text_color(0)
+        self.cell(0, 10, "最終事件雜湊值 (Final Event Hash):", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.set_font("Courier", "B", 11)
+        self.multi_cell(0, 8, proof_data['event_proof']['final_event_hash'], border=1, align='C', padding=5)
+        qr_data = proof_data['verification']['verify_url']
+        qr = qrcode.make(qr_data); qr_path = os.path.join(app.config['UPLOAD_FOLDER'], f"qr_{proof_data['report_id'][:10]}.png"); qr.save(qr_path)
+        self.ln(10); self.set_font("NotoSansTC", "", 10); self.cell(0, 10, "掃描 QR Code 前往驗證頁面", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+        self.image(qr_path, w=50, x=(self.w-50)/2)
+# --- 全域變數 ---
+session_previews = []
+latest_proof_data = None
 
-def sha256_bytes(b):
-    return hashlib.sha256(b).hexdigest()
-
-
-# === Route: 首頁 ===
-@app.route("/")
+@app.route('/')
 def index():
-    return render_template("index.html")
+    global session_previews, latest_proof_data
+    session_previews = []
+    latest_proof_data = None
+    return render_template('index.html', api_key_set=bool(API_key))
 
-
-# === Route: 生成圖像 ===
-@app.route("/generate", methods=["POST"])
+# 步驟1: 生成預覽圖 (已整合 Proof Pair)
+@app.route('/generate', methods=['POST'])
 def generate():
-    prompt = request.form.get("prompt", "")
-    seed = request.form.get("seed", "1234")
-    steps = int(request.form.get("steps", "8"))
-    base_image_id = request.form.get("base_image_id")
+    if not API_key: return jsonify({"error": "後端尚未設定 BFL_API_KEY 環境變數"}), 500
+    
+    data = request.json
+    prompt = data.get('prompt')
+    if not prompt: return jsonify({"error": "Prompt 為必填項"}), 400
 
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": prompt,
-        "steps": steps,
-        "seed": int(seed),
-    }
+    try:
+        # --- 準備 API Payload ---
+        width = int(data.get('width', 1024))
+        height = int(data.get('height', 1024))
+        
+        # 如果前端沒有傳來 seed，就隨機生成一個；否則使用前端傳來的
+        seed_input = data.get('seed')
+        seed_value = int(seed_input) if seed_input and str(seed_input).isdigit() else random.randint(1, 10**9)
 
-    # 若使用者選擇以舊圖為基底
-    if base_image_id:
-        base_path = os.path.join(GENERATED_DIR, f"{base_image_id}.png")
-        if os.path.exists(base_path):
-            with open(base_path, "rb") as f:
-                base_b64 = base64.b64encode(f.read()).decode("utf-8")
-            payload["image_prompt"] = base_b64
+        payload = {
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "seed": seed_value,
+            "steps": 20,
+            "raw": False,
+            "output_format": "png",
+            "model": "flux-pro-1.1-ultra" # 指定模型
+        }
+        
+        # --- Proof Pair 判斷 ---
+        # 如果請求中有 image_base64，則啟動 image-to-image 模式
+        image_base64_from_request = data.get('image_base64')
+        if image_base64_from_request:
+            payload["image_prompt"] = image_base64_from_request
             payload["image_prompt_strength"] = 0.5
+            print("偵測到 image_base64，以 Proof Pair 模式生成...")
+        
+        headers = {
+            "Content-Type": "application/json",
+            "x-key": API_key
+        }
 
-    headers = {"Authorization": f"Bearer {TOGETHER_API_KEY}"}
-    res = requests.post("https://api.together.xyz/v1/images/generations",
-                        headers=headers, json=payload)
+        # --- 發送請求 & 輪詢結果 ---
+        res = requests.post("https://api.bfl.ai/v1/flux-pro-1.1-ultra", headers=headers, json=payload, timeout=20)
+        res.raise_for_status()
+        
+        polling_url = res.json().get("polling_url")
+        if not polling_url: raise Exception("API 未返回 polling_url")
 
-    if res.status_code != 200:
-        return jsonify({"error": res.text}), 500
+        img_bytes = None
+        for _ in range(30): # 最多輪詢 30 次 (約 60 秒)
+            poll_res = requests.get(polling_url, headers=headers, timeout=20)
+            poll_res.raise_for_status()
+            poll_data = poll_res.json()
+            if poll_data.get("status") == "completed":
+                final_image_url = poll_data.get("output_url")
+                if not final_image_url: raise Exception("API 任務完成但未提供 output_url")
+                img_bytes = requests.get(final_image_url, timeout=60).content
+                break
+            time.sleep(2)
+        
+        if not img_bytes: raise Exception("輪詢超時，圖像生成失敗")
 
-    data = res.json()
-    polling_url = data.get("polling_url")
-    if not polling_url:
-        return jsonify({"error": "No polling URL"}), 500
+        # --- 處理與儲存圖片 ---
+        new_image_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        filename = f"preview_v{len(session_previews) + 1}_{int(time.time())}.png"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        Image.open(io.BytesIO(img_bytes)).save(filepath)
 
-    # 輪詢直到完成
-    import time
-    while True:
-        poll = requests.get(polling_url, headers=headers).json()
-        if poll.get("status") == "Ready":
-            img_url = poll["result"]["sample"]
-            img_bytes = requests.get(img_url).content
-            break
-        elif poll.get("status") == "Failed":
-            return jsonify({"error": "Generation failed"}), 500
-        time.sleep(1)
+        session_previews.append({
+            "prompt": prompt, "seed": seed_value, "model": payload['model'],
+            "width": width, "height": height, "filepath": filepath,
+            "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "image_base64": new_image_base64 # 將 base64 存入 session
+        })
+        
+        return jsonify({
+            "success": True, 
+            "preview_url": url_for('static_preview', filename=filename),
+            "version": len(session_previews),
+            "seed": seed_value, # 將 seed 回傳給前端
+            "image_base64": new_image_base64 # 將 base64 回傳給前端
+        })
 
-    img_id = str(uuid.uuid4())
-    img_path = os.path.join(GENERATED_DIR, f"{img_id}.png")
-    with open(img_path, "wb") as f:
-        f.write(img_bytes)
+    except Exception as e:
+        return jsonify({"error": f"生成失敗: {str(e)}"}), 500
 
-    hash_val = sha256_bytes(img_bytes)
-    return jsonify({
-        "image_id": img_id,
-        "image_url": f"/{img_path}",
-        "seed": seed,
-        "hash": hash_val,
-        "base_from": base_image_id or None
-    })
+# 步驟2: 結束任務，生成所有證據正本
+@app.route('/finalize_session', methods=['POST'])
+def finalize_session():
+    global latest_proof_data, session_previews
+    applicant_name = request.json.get('applicant_name')
+    if not applicant_name: return jsonify({"error": "出證申請人名稱為必填項"}), 400
+    if not session_previews: return jsonify({"error": "沒有任何預覽圖像可供結束任務"}), 400
 
+    try:
+        snapshots = []
+        image_urls = []
+        
+        for i, preview in enumerate(session_previews):
+            # 直接使用 session 中儲存的 base64，不再重新讀取檔案
+            img_base64_str = preview['image_base64']
+            snapshot_hash = sha256_bytes(img_base64_str.encode('utf-8'))
+            
+            snapshots.append({
+                "version_index": i + 1, "timestamp_utc": preview['timestamp_utc'],
+                "snapshot_hash": snapshot_hash, "prompt": preview['prompt'],
+                "seed": preview['seed'], "model": preview['model'],
+                "content_base64": img_base64_str
+            })
+            image_urls.append(url_for('static_download', filename=os.path.basename(preview['filepath'])))
 
-# === Route: 生成報告 (簡化) ===
-@app.route("/create_report", methods=["POST"])
+        report_id = str(uuid.uuid4())
+        trace_token = str(uuid.uuid4())
+        issued_at_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        
+        temp_proof_for_hashing = {"report_id": report_id, "event_proof": {"trace_token": trace_token, "snapshots": snapshots}}
+        proof_string_for_hashing = json.dumps(temp_proof_for_hashing, sort_keys=True, ensure_ascii=False).encode('utf-8')
+        final_event_hash = sha256_bytes(proof_string_for_hashing)
+
+        proof_data = {
+            "report_id": report_id, "issuer": "WesmartAI Inc.", "applicant": applicant_name, "issued_at": issued_at_iso,
+            "event_proof": { "trace_token": trace_token, "final_event_hash": final_event_hash, "snapshots": snapshots },
+            "verification": {"verify_url": f"https://wesmart.ai/verify?hash={final_event_hash}"}
+        }
+
+        json_filename = f"proof_event_{report_id}.json"
+        json_filepath = os.path.join(app.config['UPLOAD_FOLDER'], json_filename)
+        with open(json_filepath, 'w', encoding='utf-8') as f:
+            json.dump(proof_data, f, ensure_ascii=False, indent=2)
+        print(f"證據正本已儲存至: {json_filename}")
+
+        latest_proof_data = proof_data
+
+        return jsonify({"success": True, "image_urls": image_urls})
+
+    except Exception as e:
+        print(f"結束任務失敗: {e}")
+        return jsonify({"error": f"結束任務失敗: {str(e)}"}), 500
+
+# 步驟3: 產生 PDF 報告
+@app.route('/create_report', methods=['POST'])
 def create_report():
-    image_id = request.form.get("image_id")
-    prompt = request.form.get("prompt")
-    seed = request.form.get("seed")
-    hash_val = request.form.get("hash")
+    if not latest_proof_data: return jsonify({"error": "請先結束任務並生成證據"}), 400
+    
+    try:
+        report_id = latest_proof_data['report_id']
+        pdf = WesmartPDFReport()
+        pdf.create_cover(latest_proof_data)
+        pdf.create_generation_details_page(latest_proof_data)
+        pdf.create_conclusion_page(latest_proof_data)
+        
+        report_filename = f"WesmartAI_Report_{report_id}.pdf"
+        report_filepath = os.path.join(app.config['UPLOAD_FOLDER'], report_filename)
+        pdf.output(report_filepath)
 
-    img_path = os.path.join(GENERATED_DIR, f"{image_id}.png")
-    report_name = f"report_{image_id}.pdf"
+        return jsonify({"success": True, "report_url": url_for('static_download', filename=report_filename)})
+    except Exception as e:
+        print(f"報告生成失敗: {e}")
+        return jsonify({"error": f"報告生成失敗: {str(e)}"}), 500
 
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "WesmartAI Image Generation Report", ln=True)
+# --- 靜態檔案路由 ---
+@app.route('/static/preview/<path:filename>')
+def static_preview(filename): return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-    pdf.set_font("Helvetica", "", 12)
-    pdf.multi_cell(0, 8, f"Prompt: {prompt}")
-    pdf.multi_cell(0, 8, f"Seed: {seed}")
-    pdf.multi_cell(0, 8, f"Hash: {hash_val}")
-    pdf.image(img_path, x=30, y=70, w=150)
-    pdf.output(os.path.join(GENERATED_DIR, report_name))
+@app.route('/static/download/<path:filename>')
+def static_download(filename): return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
 
-    return jsonify({"report_url": f"/{GENERATED_DIR}/{report_name}"})
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == '__main__':
+    app.run(debug=True)
