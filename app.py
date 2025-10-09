@@ -1,11 +1,11 @@
 # ====================================================================
-# WesmartAI 證據報告 Web App (final_definitive_flow_v2_flux_ultra)
+# WesmartAI 證據報告 Web App (final_definitive_flow)
 # 作者: Gemini & User
-# 核心架構 (v2):
-# 1. API 端點切換至 BFL Flux 1.1 Ultra，支援 Proof Pair 機制。
-# 2. /generate 路由擴充，可接收 image_base64 進行 Image-to-Image 生成。
-# 3. 新增非同步輪詢機制以應對 BFL API。
-# 4. 前端新增「以此圖微調」按鈕，觸發 Proof Pair 流程。
+# 核心架構 (最終定案):
+# 1. 確立最終使用者流程：多次生成預覽 -> 一次性結束並下載所有原圖 -> 可選地生成PDF報告。
+# 2. 前端恢復 Seed 與尺寸輸入，後端 /generate 同步接收。
+# 3. /finalize_session 作為核心，處理整個任務的證據封裝，並回傳所有圖片連結。
+# 4. JSON 證據檔案僅存於後端，不提供給使用者。
 # ====================================================================
 
 import requests, json, hashlib, uuid, datetime, random, time, os, io, base64
@@ -16,9 +16,7 @@ from fpdf.enums import XPos, YPos
 import qrcode
 
 # --- 讀取環境變數 ---
-# 優先使用 BFL_API_KEY，若無則 fallback 至舊的 TOGETHER_API_KEY
-BFL_API_KEY = os.getenv("BFL_API_KEY")
-API_key = BFL_API_KEY or os.getenv("TOGETHER_API_KEY") 
+API_key = os.getenv("TOGETHER_API_KEY")
 
 # --- Flask App 初始化 ---
 app = Flask(__name__)
@@ -101,71 +99,26 @@ def index():
     latest_proof_data = None
     return render_template('index.html', api_key_set=bool(API_key))
 
-# 步驟1: 生成預覽圖 (已整合 Proof Pair)
+# 步驟1: 生成預覽圖
 @app.route('/generate', methods=['POST'])
 def generate():
-    if not API_key: return jsonify({"error": "後端尚未設定 BFL_API_KEY 環境變數"}), 500
+    if not API_key: return jsonify({"error": "後端尚未設定 TOGETHER_API_KEY 環境變數"}), 500
     
     data = request.json
     prompt = data.get('prompt')
     if not prompt: return jsonify({"error": "Prompt 為必填項"}), 400
 
     try:
-        # --- 準備 API Payload ---
-        width = int(data.get('width', 1024))
-        height = int(data.get('height', 1024))
-        
-        # 如果前端沒有傳來 seed，就隨機生成一個；否則使用前端傳來的
         seed_input = data.get('seed')
-        seed_value = int(seed_input) if seed_input and str(seed_input).isdigit() else random.randint(1, 10**9)
-
-        payload = {
-            "prompt": prompt,
-            "width": width,
-            "height": height,
-            "seed": seed_value,
-            "steps": 20,
-            "raw": False,
-            "output_format": "png",
-            "model": "flux-pro-1.1-ultra" # 指定模型
-        }
+        width = int(data.get('width', 512))
+        height = int(data.get('height', 512))
+        seed_value = int(seed_input) if seed_input and seed_input.isdigit() else random.randint(1, 10**9)
+        payload = {"model": "black-forest-labs/FLUX.1-schnell", "prompt": prompt, "seed": seed_value, "steps": 8, "width": width, "height": height}
         
-        # --- Proof Pair 判斷 ---
-        # 如果請求中有 image_base64，則啟動 image-to-image 模式
-        image_base64_from_request = data.get('image_base64')
-        if image_base64_from_request:
-            payload["image_prompt"] = image_base64_from_request
-            payload["image_prompt_strength"] = 0.5
-            print("偵測到 image_base64，以 Proof Pair 模式生成...")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "x-key": API_key
-        }
-
-        # --- 發送請求 & 輪詢結果 ---
-        res = requests.post("https://api.bfl.ai/v1/flux-pro-1.1-ultra", headers=headers, json=payload, timeout=20)
+        res = requests.post("https://api.together.xyz/v1/images/generations", headers={"Authorization": f"Bearer {API_key}"}, json=payload, timeout=60)
         res.raise_for_status()
+        img_bytes = requests.get(res.json()["data"][0]["url"], timeout=60).content
         
-        polling_url = res.json().get("polling_url")
-        if not polling_url: raise Exception("API 未返回 polling_url")
-
-        img_bytes = None
-        for _ in range(30): # 最多輪詢 30 次 (約 60 秒)
-            poll_res = requests.get(polling_url, headers=headers, timeout=20)
-            poll_res.raise_for_status()
-            poll_data = poll_res.json()
-            if poll_data.get("status") == "completed":
-                final_image_url = poll_data.get("output_url")
-                if not final_image_url: raise Exception("API 任務完成但未提供 output_url")
-                img_bytes = requests.get(final_image_url, timeout=60).content
-                break
-            time.sleep(2)
-        
-        if not img_bytes: raise Exception("輪詢超時，圖像生成失敗")
-
-        # --- 處理與儲存圖片 ---
-        new_image_base64 = base64.b64encode(img_bytes).decode('utf-8')
         filename = f"preview_v{len(session_previews) + 1}_{int(time.time())}.png"
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         Image.open(io.BytesIO(img_bytes)).save(filepath)
@@ -173,16 +126,13 @@ def generate():
         session_previews.append({
             "prompt": prompt, "seed": seed_value, "model": payload['model'],
             "width": width, "height": height, "filepath": filepath,
-            "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "image_base64": new_image_base64 # 將 base64 存入 session
+            "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()
         })
         
         return jsonify({
             "success": True, 
             "preview_url": url_for('static_preview', filename=filename),
-            "version": len(session_previews),
-            "seed": seed_value, # 將 seed 回傳給前端
-            "image_base64": new_image_base64 # 將 base64 回傳給前端
+            "version": len(session_previews)
         })
 
     except Exception as e:
@@ -201,8 +151,8 @@ def finalize_session():
         image_urls = []
         
         for i, preview in enumerate(session_previews):
-            # 直接使用 session 中儲存的 base64，不再重新讀取檔案
-            img_base64_str = preview['image_base64']
+            with open(preview['filepath'], "rb") as f: definitive_bytes = f.read()
+            img_base64_str = base64.b64encode(definitive_bytes).decode('utf-8')
             snapshot_hash = sha256_bytes(img_base64_str.encode('utf-8'))
             
             snapshots.append({
